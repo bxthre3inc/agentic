@@ -29,6 +29,7 @@ use std::sync::Arc;
 use crate::db::Database;
 use crate::core::truth_gate::TruthGate;
 use crate::core::shell::DeterministicShell;
+use crate::core::{AgentRegistry, DapEngine, EventBus, TaskQueue};
 
 /// Application state — shared across all routes.
 pub struct AppState {
