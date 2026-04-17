@@ -1,0 +1,552 @@
+"""
+Unified Gateway — AgentOS Single Entry Point
+Bxthre3/agentic/kernel/gateway/unified_gateway.py
+
+Exposes a monolithic HTTP API surface. Internally routes to
+service_mesh (event_bus, peer_bridge, agent_runtime) and kernel
+services (tool_registry, chairman_queue, evaluator).
+
+No business logic lives here — pure dispatcher.
+"""
+import sys, os
+sys.path.insert(0, '/home/workspace')
+sys.path.insert(0, '/home/workspace/Bxthre3')
+
+from flask import Flask, request, jsonify
+from Bxthre3.agentic.kernel.tool_registry import route_tool_call, parse_lfm_tool_call, list_tools
+from Bxthre3.agentic.kernel.gateway.chairman_queue import enqueue, get_pending, approve, get_by_id
+from Bxthre3.agentic.kernel.service_mesh.peer_bridge.peer_bridge import register_peer, list_peers, publish_message, get_messages, get_mesh_summary
+from Bxthre3.agentic.kernel.service_mesh.agent_runtime.agent_runtime import get_runtime, infer_sync, TierAssignment
+from Bxthre3.agentic.kernel.service_mesh.evaluator.evaluator import grade_tool_call, grade_agent_round_trip, get_agent_grade
+from Bxthre3.agentic.kernel.service_mesh.event_bus import subscribe, drain_all, list_subscriptions, emit_training_event
+from Bxthre3.agentic.kernel.notification_service import dispatch as _notif_dispatch, notify_chairman as _notify_chairman, notify_training as _notify_training_stage, get_recent as _get_notif_recent, Priority as NPriority, NotifChannel as NChannel
+import json
+from pathlib import Path
+from enum import Enum
+from Bxthre3.agentic.kernel.auth_service import (
+    login, get_session, logout, verify_api_key,
+    require_role, audit_log, create_api_key, list_api_keys,
+    delete_api_key, list_users, get_audit_log
+)
+
+AGENTIC_STORE = Path(__file__).parent / "agentic-store.json"
+GRANTS_DB    = Path(__file__).parent.parent.parent / "store" / "grants_pipeline.json"
+
+app = Flask(__name__)
+
+def _flat(obj):
+    """Recursively convert Enum values and dataclasses to plain Python."""
+    from dataclasses import is_dataclass, asdict as _asdict
+    if isinstance(obj, Enum):
+        return obj.value
+    if is_dataclass(obj):
+        return {k: _flat(v) for k, v in _asdict(obj).items()}
+    if isinstance(obj, dict):
+        return {k: _flat(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_flat(i) for i in obj]
+    return obj
+
+# ─── Health ───────────────────────────────────────────────────────────────────
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "agentos-gateway"})
+
+# ─── Tool Registry ─────────────────────────────────────────────────────────────
+
+@app.route("/api/tools", methods=["GET"])
+def api_list_tools():
+    tools = list_tools()  # returns list[ToolDef]
+    by_tier = {"T0": [], "T1": [], "T2": []}
+    for t in tools:
+        tier_str = str(t.tier.value) if hasattr(t.tier, 'value') else str(t.tier)
+        by_tier.setdefault(tier_str, []).append(t.name)
+    return jsonify({"count": len(tools), "by_tier": by_tier})
+
+@app.route("/api/tools/route", methods=["POST"])
+def api_route_tool():
+    body = request.json
+    agent_did = body.get("agent_did", "did:agentos:unknown")
+    raw_lfm_call = body.get("raw_lfm_call", "")
+    result = route_tool_call(agent_did, raw_lfm_call)
+    return jsonify(result)
+
+# ─── Chairman Queue ────────────────────────────────────────────────────────────
+
+@app.route("/api/chairman/enqueue", methods=["POST"])
+def api_enqueue():
+    body = request.json
+    result = enqueue(
+        agent_did=body.get("agent_did"),
+        raw_tool_call=body.get("raw_tool_call"),
+        intent_summary=body.get("intent_summary", ""),
+        risk_level=body.get("risk_level", "MEDIUM"),
+        ttl_minutes=body.get("ttl_minutes", 60)
+    )
+    return jsonify(result)
+
+@app.route("/api/chairman/pending", methods=["GET"])
+def api_pending():
+    return jsonify({"items": get_pending()})
+
+@app.route("/api/chairman/approve/<item_id>", methods=["POST"])
+def api_approve(item_id):
+    body = request.json
+    result = approve(item_id, body.get("rationale", ""))
+    return jsonify(result)
+
+@app.route("/api/chairman/item/<item_id>", methods=["GET"])
+def api_item(item_id):
+    return jsonify(get_by_id(item_id))
+
+# ─── Peer Bridge ─────────────────────────────────────────────────────────────
+
+@app.route("/api/mesh/register", methods=["POST"])
+def api_register_peer():
+    body = request.json
+    return jsonify(register_peer(
+        peer_id=body.get("peer_id"),
+        mcp_server_url=body.get("mcp_server_url"),
+        capabilities=body.get("capabilities", []),
+        api_key=body.get("api_key")
+    ))
+
+@app.route("/api/mesh/peers", methods=["GET"])
+def api_list_peers():
+    return jsonify(list_peers())
+
+@app.route("/api/mesh/summary", methods=["GET"])
+def api_mesh_summary():
+    summary = get_mesh_summary()
+    return jsonify(summary)
+
+@app.route("/api/mesh/publish", methods=["POST"])
+def api_publish():
+    body = request.json
+    return jsonify(publish_message(body.get("to"), body.get("topic"), body.get("payload")))
+
+@app.route("/api/mesh/inbox", methods=["GET"])
+def api_inbox():
+    return jsonify({"messages": get_messages(body.get("peer_id", "agentic"))})
+
+# ─── Agent Runtime ────────────────────────────────────────────────────────────
+
+@app.route("/api/runtime", methods=["GET"])
+def api_runtime():
+    from Bxthre3.agentic.kernel.service_mesh.agent_runtime.agent_runtime import get_runtime
+    rt = get_runtime()
+    return jsonify({
+        "model": str(rt.model),
+        "status": str(rt.status.value if hasattr(rt.status, 'value') else rt.status),
+        "default_tier": str(rt.default_tier.value if hasattr(rt.default_tier, 'value') else rt.default_tier),
+        "queue_depth": rt.get_queue_depth(),
+    })
+
+@app.route("/api/runtime/infer", methods=["POST"])
+def api_infer():
+    body = request.json
+    prompt = body.get("prompt", "")
+    model  = body.get("model", "zo-cloud")
+    result = infer_sync(model, prompt, event_bus=None)
+    return jsonify(result)
+
+# ─── Evaluator ────────────────────────────────────────────────────────────────
+
+@app.route("/api/eval/tool", methods=["POST"])
+def api_eval_tool():
+    from dataclasses import asdict as _asdict
+    body = request.json
+    result = grade_tool_call(
+        tool_name=body.get("tool_name"),
+        gold_args=body.get("gold_args", {}),
+        pred_args=body.get("pred_args", {}),
+        pred_result=body.get("pred_result"),
+        latency_ms=body.get("latency_ms")
+    )
+    return app.response_class(json.dumps(_flat(result)), mimetype="application/json")
+
+@app.route("/api/eval/agent-round", methods=["POST"])
+def api_eval_agent():
+    body = request.json
+    return jsonify(_flat(grade_agent_round_trip(
+        agent_did=body.get("agent_did"),
+        task=body.get("task"),
+        tool_calls=body.get("tool_calls", []),
+        final_response=body.get("final_response"),
+        expected_outcome=body.get("expected_outcome")
+    )))
+
+@app.route("/api/eval/summary", methods=["GET"])
+def api_eval_summary():
+    from Bxthre3.agentic.kernel.service_mesh.evaluator.evaluator import get_agent_grade
+    aid = request.args.get("agent_id", "agentic")
+    grade = get_agent_grade(aid)
+    return jsonify({"agent_id": aid, "grade": grade})
+
+# ─── Events ───────────────────────────────────────────────────────────────────
+
+@app.route("/api/events/subscribe", methods=["POST"])
+def api_subscribe():
+    body = request.json
+    sub_id = subscribe(body.get("channel"), body.get("callback_name"))
+    return jsonify({"subscription_id": sub_id})
+
+@app.route("/api/events", methods=["GET"])
+def api_events():
+    channel = request.args.get("channel", "agentic.tool.events")
+    events = drain_all()
+    return jsonify({"channel": channel, "count": len(events), "events": events})
+
+@app.route("/api/events/subscriptions", methods=["GET"])
+def api_subs():
+    return jsonify(list_subscriptions())
+
+# ─── Training Pipeline ────────────────────────────────────────────────────────
+
+from Bxthre3.agentic.kernel.service_mesh.training_gateway.training_gateway import (
+    create_run, get_run, advance_stage, approve_hitl,
+    submit_sample, get_samples, get_pending_hitl, trigger_eval, list_runs
+)
+
+@app.route("/api/training/run", methods=["POST"])
+def api_create_training_run():
+    body = request.json
+    run_id = create_run(
+        agent_did=body.get("agent_did", "did:agentos:chairman"),
+        base_model=body.get("base_model", "LFM2.5-350M"),
+        sample_source=body.get("sample_source", "agentic")
+    )
+    emit_training_event(run_id, "S0_COLLECT", "created")
+    return jsonify({"run_id": run_id, "stage": "S0_COLLECT", "status": "RUNNING"})
+
+@app.route("/api/training/runs", methods=["GET"])
+def api_list_training_runs():
+    runs = list_runs()
+    return jsonify({"runs": [_flat(r) for r in runs], "count": len(runs)})
+
+@app.route("/api/training/run/<run_id>", methods=["GET"])
+def api_get_training_run(run_id):
+    run = get_run(run_id)
+    if not run:
+        return jsonify({"error": f"Run '{run_id}' not found"}), 404
+    return jsonify(_flat(run))
+
+@app.route("/api/training/run/<run_id>/advance", methods=["POST"])
+def api_advance_training_run(run_id):
+    operator = request.json.get("operator", "system") if request.is_json else "system"
+    ok = advance_stage(run_id, operator)
+    run = get_run(run_id)
+    return jsonify({"ok": ok, "stage": run.stage.value if run else "UNKNOWN", "run_id": run_id})
+
+@app.route("/api/training/run/<run_id>/hitl/approve", methods=["POST"])
+def api_approve_hitl(run_id):
+    approver = request.json.get("approver_did", "did:agentos:chairman")
+    ok = approve_hitl(run_id, approver)
+    return jsonify({"ok": ok, "run_id": run_id})
+
+@app.route("/api/training/run/<run_id>/samples", methods=["GET"])
+def api_get_training_samples(run_id):
+    return jsonify({"run_id": run_id, "samples": get_samples(run_id)})
+
+@app.route("/api/training/run/<run_id>/sample", methods=["POST"])
+def api_submit_training_sample(run_id):
+    body = request.json
+    sid = submit_sample(
+        rid=run_id,
+        conversation_id=body.get("conversation_id", "synth"),
+        role=body.get("role", "assistant"),
+        content=body.get("content", ""),
+        lfm_tool_call=body.get("lfm_tool_call"),
+        gold_reasoning=body.get("gold_reasoning"),
+        sample_type=body.get("sample_type", "TOOL_CALL"),
+        grade_score=body.get("grade_score", 1.0)
+    )
+    return jsonify({"sample_id": sid, "run_id": run_id})
+
+@app.route("/api/training/run/<run_id>/eval", methods=["POST"])
+def api_trigger_training_eval(run_id):
+    result = trigger_eval(run_id)
+    return jsonify(result)
+
+@app.route("/api/training/pending-hitl", methods=["GET"])
+def api_pending_hitl():
+    runs = get_pending_hitl()
+    return jsonify({"runs": [_flat(r) for r in runs], "count": len(runs)})
+
+# ─── Gateway info ─────────────────────────────────────────────────────────────
+
+@app.route("/api/gateway/info", methods=["GET"])
+def api_info():
+    return jsonify({
+        "service": "AgentOS Unified Gateway",
+        "version": "1.0.0",
+        "endpoints": {
+            "tools": "/api/tools",
+            "route": "/api/tools/route",
+            "chairman": "/api/chairman/enqueue",
+            "mesh": "/api/mesh/peers",
+            "runtime": "/api/runtime",
+            "evaluator": "/api/eval/tool",
+            "events": "/api/events"
+        }
+    })
+
+# ─── Agents ───────────────────────────────────────────────────────────────────
+
+@app.route("/api/agents", methods=["GET"])
+def api_agents():
+    store = json.loads(AGENTIC_STORE.read_text()) if AGENTIC_STORE.exists() else {}
+    agents = store.get("agents", [])
+    return jsonify({"agents": agents, "count": len(agents)})
+
+@app.route("/api/agents/<agent_id>/<action>", methods=["POST"])
+def api_agent_action(agent_id, action):
+    allowed = {"start", "stop", "restart", "pause"}
+    if action not in allowed:
+        return jsonify({"error": f"Unknown action '{action}'"}), 400
+    store = json.loads(AGENTIC_STORE.read_text()) if AGENTIC_STORE.exists() else {}
+    agents = store.get("agents", [])
+    for a in agents:
+        if a.get("id") == agent_id:
+            a["status"] = action.upper()
+            a["last_action"] = action
+            break
+    store["agents"] = agents
+    AGENTIC_STORE.write_text(json.dumps(store, indent=2))
+    return jsonify({"ok": True, "agent_id": agent_id, "action": action})
+
+# ─── Subsidiaries ─────────────────────────────────────────────────────────────
+
+@app.route("/api/subsidiaries", methods=["GET"])
+def api_subsidiaries():
+    subs = [
+        {"id": "irrig8",    "name": "Irrig8",    "status": "active",   "health": 0.92},
+        {"id": "vpc",      "name": "Valley Players Club", "status": "active", "health": 0.87},
+        {"id": "rain",     "name": "RAIN",      "status": "active",   "health": 0.78},
+        {"id": "ard",      "name": "AgentOS R&D","status": "active",   "health": 0.95},
+        {"id": "bab",      "name": "Build-A-Biz","status": "active",   "health": 0.81},
+        {"id": "trench",   "name": "TrenchBabys","status": "active",   "health": 0.73},
+    ]
+    return jsonify({"subsidiaries": subs, "count": len(subs)})
+
+# ─── Grants Pipeline ───────────────────────────────────────────────────────────
+
+@app.route("/api/grants", methods=["GET"])
+def api_grants():
+    grants = [
+        {"id": "arpa-e-2026",  "name": "ARPA-E OPEN 2026",      "due": "2026-05-01", "amount": 350000, "status": "active",  "stage": "pre-submission"},
+        {"id": "cig-colorado", "name": "CIG Colorado FY2026",   "due": "2026-06-15", "amount": 75000,  "status": "active",  "stage": "prospecting"},
+        {"id": "usda-sbir",    "name": "USDA SBIR Phase I",      "due": "2026-07-15", "amount": 100000, "status": "prospecting", "stage": "research"},
+    ]
+    return jsonify({"grants": grants, "count": len(grants)})
+
+# ─── Auth Routes ─────────────────────────────────────────────────────────────
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_login():
+    body = request.json
+    sess = login(body.get("user_id"), pin=body.get("pin"), password=body.get("password"))
+    if not sess:
+        return jsonify({"error": "Invalid credentials"}), 401
+    resp = jsonify({"user_id": sess["user_id"], "name": sess["name"], "role": sess["role"], "expires_at": sess["expires_at"]})
+    resp.set_cookie(SESSION_COOKIE, sess["session_id"], httponly=True, samesite="Strict", max_age=86400)
+    audit_log(action="login", user_id=sess["user_id"], role=sess["role"], result="success")
+    return resp
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_logout():
+    sess_id = request.cookies.get(SESSION_COOKIE)
+    if sess_id:
+        sess = get_session(sess_id)
+        if sess:
+            audit_log(session_id=sess_id, action="logout", user_id=sess["user_id"], role=sess["role"], result="success")
+        logout(sess_id)
+    resp = jsonify({"logged_out": True})
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
+@app.route("/api/auth/me", methods=["GET"])
+def api_me():
+    creds = get_credentials(request)
+    if not creds:
+        return jsonify({"authenticated": False}), 401
+    return jsonify({"authenticated": True, **creds})
+
+@app.route("/api/auth/keys", methods=["GET"])
+def api_list_keys():
+    creds = get_credentials(request)
+    if not creds or not require_role(creds, "admin"):
+        return jsonify({"error": "Forbidden"}), 403
+    return jsonify({"keys": list_api_keys()})
+
+@app.route("/api/auth/keys", methods=["POST"])
+def api_create_key():
+    creds = get_credentials(request)
+    if not creds or not require_role(creds, "admin"):
+        return jsonify({"error": "Forbidden"}), 403
+    body = request.json
+    key_id, raw_key = create_api_key(body.get("user_id", "admin"), body.get("name", "API Key"), body.get("role", "operator"))
+    audit_log(user_id=creds["user_id"], role=creds["role"], action="create_api_key", resource=key_id, result="created")
+    return jsonify({"key_id": key_id, "api_key": raw_key, "warning": "Copy this key — it will not be shown again."})
+
+@app.route("/api/auth/keys/<key_id>", methods=["DELETE"])
+def api_delete_key(key_id):
+    creds = get_credentials(request)
+    if not creds or not require_role(creds, "admin"):
+        return jsonify({"error": "Forbidden"}), 403
+    ok = delete_api_key(key_id)
+    audit_log(user_id=creds["user_id"], role=creds["role"], action="delete_api_key", resource=key_id, result="deleted" if ok else "not_found")
+    return jsonify({"deleted": ok})
+
+@app.route("/api/auth/users", methods=["GET"])
+def api_list_users():
+    creds = get_credentials(request)
+    if not creds or not require_role(creds, "admin"):
+        return jsonify({"error": "Forbidden"}), 403
+    return jsonify({"users": list_users()})
+
+@app.route("/api/auth/audit", methods=["GET"])
+def api_audit():
+    creds = get_credentials(request)
+    if not creds or not require_role(creds, "admin"):
+        return jsonify({"error": "Forbidden"}), 403
+    entries = get_audit_log(limit=int(request.args.get("limit", 100)))
+    return app.response_class(json.dumps(_flat(entries)), mimetype="application/json")
+
+# ─── Protected Route Wrapper ─────────────────────────────────────────────────
+# Apply @require_role("admin") decorator to any route that needs protection
+# Example: @require_role("operator") on tool execution routes
+
+SESSION_COOKIE = "agentos_session"
+API_KEY_HEADER = "X-AgentOS-Key"
+
+def get_credentials(req):
+    """Extract session or API key from request. Returns dict with role or None."""
+    # Check header key first (API calls)
+    key = req.headers.get(API_KEY_HEADER) or req.headers.get("Authorization", "").replace("Bearer ", "")
+    if key:
+        vk = verify_api_key(key)
+        if vk:
+            return vk
+    # Check session cookie
+    sess_id = req.cookies.get(SESSION_COOKIE)
+    if sess_id:
+        sess = get_session(sess_id)
+        if sess:
+            return sess
+    return None
+
+def auth_required(role="admin"):
+    """Decorator factory: enforce auth + role on routes."""
+    def decorator(f):
+        def wrapped(req, *args, **kwargs):
+            creds = get_credentials(req)
+            if not creds:
+                return jsonify({"error": "Unauthorized"}), 401
+            if not require_role(creds, role):
+                return jsonify({"error": "Forbidden — requires " + role}), 403
+            req.auth_context = creds
+            return f(req, *args, **kwargs)
+        wrapped.__name__ = f.__name__
+        return wrapped
+    return decorator
+
+
+# ─── Notifications ─────────────────────────────────────────────────────────────
+@app.route("/api/notifications", methods=["GET"])
+def api_notifications():
+    limit = request.args.get("limit", 20, type=int)
+    items = _get_notif_recent(limit=limit)
+    out = []
+    for n in items:
+        p = n.priority.value if hasattr(n.priority, "value") else str(n.priority)
+        ch = n.channel.value if hasattr(n.channel, "value") else str(n.channel)
+        out.append({"notif_id": n.notif_id, "priority": p, "channel": ch,
+                    "subject": n.subject, "body": n.body,
+                    "delivered": bool(n.delivered), "created_at": n.created_at})
+    return app.response_class(response=json.dumps(out), status=200, mimetype="application/json")
+
+@app.route("/api/notifications/test", methods=["POST"])
+def api_notif_test():
+    result = _notif_dispatch(NPriority.P1, "Test notification",
+                             "AgentOS notification system is working", NChannel.SMS)
+    return jsonify({"notif_id": result.notif_id, "status": "sent"})
+
+@app.route("/api/notifications/push", methods=["POST"])
+def api_notif_push():
+    body = request.json
+    p = NPriority[body.get("priority", "P3")]
+    ch = NChannel[body.get("channel", "INBOX")]
+    result = _notif_dispatch(p, body["subject"], body.get("body",""), ch)
+    return jsonify({"notif_id": result.notif_id})
+
+
+
+# ═══════════════════════════════════════════════════════════════
+#  WORKFLOW ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+@app.route("/api/workflows", methods=["GET"])
+def api_list_workflows():
+    status_filter = request.args.get("status")
+    agent_did = request.args.get("agent_did")
+    from Bxthre3.agentic.kernel.workflow_engine import WorkflowStatus as WS, list_workflows
+    status = WS(status_filter) if status_filter else None
+    wfs = list_workflows(agent_did=agent_did, status=status)
+    return jsonify({"count": len(wfs), "workflows": [{"id": w.workflow_id, "name": w.name, "status": w.status.value, "agent": w.agent_did, "steps": len(w.steps), "current_step": w.current_step, "created_at": w.created_at} for w in wfs]})
+
+@app.route("/api/workflows", methods=["POST"])
+def api_create_workflow():
+    body = request.json
+    from Bxthre3.agentic.kernel.workflow_engine import Step, create_workflow, notify_workflow_progress
+    steps = [Step(step_id=f's-{i}', name=s.get("name", s["tool"]), tool=s["tool"], args=s.get("args",{}), condition=s.get("condition"), next_step=s.get("next_step"), on_fail=s.get("on_fail"), hitl_required=s.get("hitl_required", False)) for i, s in enumerate(body.get("steps", []))]
+    wid = create_workflow(name=body.get("name", "Unnamed"), agent_did=body.get("agent_did", "did:agentos:unknown"), steps=steps)
+    return jsonify({"workflow_id": wid, "status": "PENDING"})
+
+@app.route("/api/workflows/<wid>/execute", methods=["POST"])
+def api_execute_step(wid):
+    from Bxthre3.agentic.kernel.workflow_engine import execute_step
+    result = execute_step(wid)
+    return jsonify(result)
+
+@app.route("/api/workflows/<wid>/approve", methods=["POST"])
+def api_approve_workflow(wid):
+    body = request.json
+    from Bxthre3.agentic.kernel.workflow_engine import approve_workflow_step
+    result = approve_workflow_step(wid, body.get("approver_did", "did:agentos:admin"), body.get("approved", True))
+    return jsonify(result)
+
+@app.route("/api/workflows/<wid>", methods=["GET"])
+def api_get_workflow(wid):
+    from Bxthre3.agentic.kernel.workflow_engine import get_workflow, get_workflow_history
+    wf = get_workflow(wid)
+    if not wf: return jsonify({"error": "not found"}), 404
+    history = get_workflow_history(wid)
+    return jsonify({"workflow_id": wf.workflow_id, "name": wf.name, "status": wf.status.value, "current_step": wf.current_step, "steps": [{"step_id": s.step_id, "name": s.name, "tool": s.tool, "hitl": s.hitl_required} for s in wf.steps], "context": wf.context, "history": history})
+
+@app.route("/api/workflows/pending-approvals", methods=["GET"])
+def api_workflow_pending():
+    from Bxthre3.agentic.kernel.workflow_engine import get_pending_approvals
+    wfs = get_pending_approvals()
+    return jsonify({"count": len(wfs), "workflows": [{"id": w.workflow_id, "name": w.name, "step": w.steps[w.current_step].name if w.current_step < len(w.steps) else "done"} for w in wfs]})
+
+# Template builders
+@app.route("/api/workflows/template/irrigation", methods=["POST"])
+def api_tpl_irrigation():
+    body = request.json
+    from Bxthre3.agentic.kernel.workflow_engine import build_irrigation_diagnostic
+    wid = build_irrigation_diagnostic(body.get("farm_id", "unknown"))
+    return jsonify({"workflow_id": wid, "template": "irrigation_diagnostic"})
+
+@app.route("/api/workflows/template/grants", methods=["POST"])
+def api_tpl_grants():
+    body = request.json
+    from Bxthre3.agentic.kernel.workflow_engine import build_grant_prospect_workflow
+    wid = build_grant_prospect_workflow(body.get("agent_did", "did:agentos:grants"), body.get("focus_area", "agriculture"))
+    return jsonify({"workflow_id": wid, "template": "grant_prospector"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("AGENTIC_GATEWAY_PORT", 3097))
+    app.run(host="0.0.0.0", port=port, debug=False)
