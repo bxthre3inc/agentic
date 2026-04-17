@@ -258,3 +258,12 @@ docker run -p 3001:3001 agentic
 - Standalone source: `github.com/bxthre3inc/agentic`
 - Zo prototype: `Bxthre3/projects/the-agentic-project/`
 - Full feature audit: `Bxthre3/INBOX/agentic-variant-audit.md`
+
+## Core Modules (Layer 2 — all implemented)
+
+| Module | File | Status | Notes |
+|--------|------|--------|-------|
+| Truth Gate | `src/core/truth_gate.rs` | ✅ Done | SHA3-256 source hashing, per-class max age, kill switch |
+| Deterministic Shell | `src/core/shell.rs` | ✅ Done | 18 whitelisted commands, rate limits, e-stop |
+| Self-Modification Engine | `src/core/self_mod.rs` | ✅ Done | Darwin Gödel Cycle, immutable core enforced |
+| Rollback + Cascade Pause | `src/core/rollback.rs` | ✅ Done | Cascade lifecycle, rollback points, coherence check |
