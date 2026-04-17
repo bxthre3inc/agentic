@@ -267,3 +267,5 @@ docker run -p 3001:3001 agentic
 | Deterministic Shell | `src/core/shell.rs` | ✅ Done | 18 whitelisted commands, rate limits, e-stop |
 | Self-Modification Engine | `src/core/self_mod.rs` | ✅ Done | Darwin Gödel Cycle, immutable core enforced |
 | Rollback + Cascade Pause | `src/core/rollback.rs` | ✅ Done | Cascade lifecycle, rollback points, coherence check |
+| CTC Engine | `src/core/ctc_engine.rs` | ✅ Done | Silicon-speed ETA injection, token budget, THINK directive, self-verify |
+| Inference Node | `src/core/inference.rs` | ✅ Done | TCO→IER→LLM→CTC pipeline, regex fallback, mesh offload, RQE performance logging |
