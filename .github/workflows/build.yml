@@ -1,0 +1,32 @@
+name: Build Agentic
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: |
+          cargo build --release 2>&1
+
+      - name: Run tests
+        run: |
+          cargo test --no-fail-fast 2>&1 | tail -30
+
+      - name: Upload binary
+        if: success()
+        run: |
+          ls -la target/release/agentic-core 2>/dev/null && echo "✅ Binary ready" || echo "❌ No binary"
