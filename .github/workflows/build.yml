@@ -146,33 +146,33 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: ${{ inputs.rust_version || '1.85' }}
+          toolchain: stable
 
-      - name: Setup Android NDK
+      - name: Install Android NDK
         run: |
-          cargo install cargo-ndk 2>/dev/null || true
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_ROOT" >> $GITHUB_ENV
+          curl -fsSL https://github.com/nickthathasnotbeenusedyet/android-ndk-r26b/releases/download/r26b/android-ndk-r26b-linux.zip -o /tmp/ndk.zip
+          unzip -q /tmp/ndk.zip -d /opt
+          echo "ANDROID_NDK_HOME=/opt/android-ndk-r26b" >> $GITHUB_ENV
+          echo "NDK_HOME=/opt/android-ndk-r26b" >> $GITHUB_ENV
 
-      - name: Install NDK
-        uses: nicksago/actions-ndk@main
-        with:
-          ndk-version: r26b
-
-      - name: Build Android targets
+      - name: Setup Rust Android targets
         run: |
-          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
-          cargo build --release --package agentic-core \
-            --target aarch64-linux-android \
-            --target armv7-linux-androideabi \
-            --target x86_64-linux-android || true
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build Android
+        run: |
+          cargo ndk -o ./jni/libs/ build --release --package agentic-core
+          ls -lh ./jni/libs/
 
       - name: Package
         run: |
           mkdir -p artifacts/android
-          for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android; do
-            cp target/$target/release/agentic-core artifacts/android/ 2>/dev/null && \
-            echo "Built $target" || echo "MISSING $target"
-          done
+          cp ./jni/libs/*.a ./jni/libs/agentic-core ./jni/libs/*.so artifacts/android/ 2>/dev/null || true
+          curl -fsSL https://github.com/nickthathasnotbeenusedyet/cargo-apk/releases/download/v0.9.1/cargo-apk-x86_64-unknown-linux-gnu -o /tmp/cargo-apk && chmod +x /tmp/cargo-apk
+          ./jni/libs/agentic-core --version 2>/dev/null || true
           tar -czf agentic-android.tar.gz -C artifacts android/
           ls -lh agentic-android.tar.gz
 
@@ -184,7 +184,7 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────
-  # JOB 5: iOS cross-compile
+  # JOB 5: iOS universal binary
   # ─────────────────────────────────────────────
   ios:
     name: Build iOS
@@ -196,22 +196,25 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: ${{ inputs.rust_version || '1.85' }}
+          toolchain: stable
 
-      - name: Install lipo
-        run: |
-          cargo install cargo-lipo 2>/dev/null || true
-          rustup target add aarch64-apple-ios x86_64-apple-ios
+      - name: Add iOS targets
+        run: rustup target add aarch64-apple-ios x86_64-apple-ios aarch64-apple-ios-sim
 
-      - name: Build iOS
+      - name: Install cargo-lipo
+        run: cargo install cargo-lipo
+
+      - name: Build universal iOS library
         run: |
-          cargo lipo --release --package agentic-core || true
+          cargo lipo --release --package agentic-core --targets aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+          ls -lh target/universal-apple-darwin/release/*.a 2>/dev/null || ls -lh target/*/release/*.a 2>/dev/null || true
+          file target/universal-apple-darwin/release/libagentic.a 2>/dev/null || true
 
       - name: Package
         run: |
           mkdir -p artifacts/ios
-          cp target/universal-apple-darwin/release/libagentic.a artifacts/ios/ 2>/dev/null || \
-          cp target/aarch64-apple-ios/release/libagentic.a artifacts/ios/libagentic_arm64.a 2>/dev/null || true
+          find target -name "libagentic.a" -exec cp {} artifacts/ios/ \; 2>/dev/null || true
+          find target -name "agentic-core" -exec cp {} artifacts/ios/ \; 2>/dev/null || true
           tar -czf agentic-ios.tar.gz -C artifacts ios/
           ls -lh agentic-ios.tar.gz
 
