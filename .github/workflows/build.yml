@@ -96,7 +96,7 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: windows-latest
             artifact: agentic-x86_64-pc-windows-gnu.tar.gz
-        fail-fast: false
+        fail-fast: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -150,7 +150,7 @@ jobs:
 
       - name: Install Android NDK
         run: |
-          curl -fsSL https://github.com/nickthathasnotbeenusedyet/android-ndk-r26b/releases/download/r26b/android-ndk-r26b-linux.zip -o /tmp/ndk.zip
+          curl -fsSL https://dl.google.com/android/repository/android-ndk-r26b-linux.zip -o /tmp/ndk.zip
           unzip -q /tmp/ndk.zip -d /opt
           echo "ANDROID_NDK_HOME=/opt/android-ndk-r26b" >> $GITHUB_ENV
           echo "NDK_HOME=/opt/android-ndk-r26b" >> $GITHUB_ENV
