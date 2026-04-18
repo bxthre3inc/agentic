@@ -164,6 +164,7 @@ jobs:
 
       - name: Build Android
         run: |
+          export PATH=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
           cargo ndk -o ./jni/libs/ build --release --package agentic-core
           ls -lh ./jni/libs/
 
